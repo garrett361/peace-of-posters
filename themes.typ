@@ -50,6 +50,24 @@
     ),
 )
 
+#let ibm = (
+    "body-box-args": (
+        inset: 0.6em,
+        width: 100%,
+    ),
+    "body-text-args": (:),
+    "heading-box-args": (
+        inset: 0.6em,
+        width: 100%,
+        fill: rgb("#000000"),
+        stroke: rgb("#1d154d"),
+    ),
+    "heading-text-args": (
+        fill: white,
+    ),
+)
+
+
 #let uq = (
     "body-box-args": (
         inset: 0.6em,
