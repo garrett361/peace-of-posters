@@ -9,8 +9,10 @@
 #set block(spacing: box-spacing)
 #pop.update-poster-layout(spacing: box-spacing)
 
+#let GG(content) = text(fill: red)[GG: #content]
+
 #pop.title-box(
-  "Context Parallel Mamba2: Scaling to 1M+ Context Lengths",
+  "Context-Parallel Mamba2: Scaling to 1M+ Tokens",
   authors: "Garrett Goon",
   // institutes: "IBM Research",
   // keywords: "Peace, Dove, Poster, Science",
@@ -20,25 +22,25 @@
 #columns(
   2,
   [
+
     #pop.column-box(heading: "Mamba2: A Linear Attention Layer")[
 
-    The quadratic `O(seqlen ^ 2)` scaling of the standard Transformers attention mechanism has
+    The quadratic $cal(O)( mono("seqlen")^( 2 ) )$ scaling of the standard Transformers attention mechanism has
     increasingly become a bottleneck as context lengths have ballooned with the advent of reasoning
     models and rising prevalence of modalities such as video and audio.
 
     Mamba2 @dao2024transformersssmsgeneralizedmodels is an alternative information propagation
-    algorithm belonging to the steadily growing class of _linear_ `O(seqlen)` attention mechanisms.
-    Its GPU-aware design enables competitive hardware utilization to quadratic attention during
-    training, and reduces the time and space complexity during decode from `O(seqlen)` to `O(1)`.
+    algorithm belonging to the steadily growing class of _linear_ $cal(O)( mono("seqlen") )$ attention mechanisms.
+    Its GPU-aware design enables hardware utilization comparable to quadratic attention during
+    training, and reduces the decoding time and cache-space from $cal(O)( mono("seqlen") )$ to $cal(O)( 1 )$. #GG[MODEL REFS!]
+ #GG[Arch summary table]
 
     Fully leveraging this improved scaling requires efficient training of Mamba2-based models on
     long-sequence documents, which poses engineering challenges due to the linear memory growth with
-    context length.
+    context length. Context-parallelism, in which sequences are sharded along the sequence dimension
+    across GPUs, is a natural and scalable approach to long-sequence training. This poster describes
+    context-parallel implementation for Mamba2. #GG[Should probably mention ring attn somewhere]
 
-
-      'Columbidae is a bird family consisting of doves and pigeons.
-      It is the only family in the order Columbiformes.'
-      #cite(<wiki:Columbidae>)
 
       #figure(
         caption: [
@@ -48,41 +50,41 @@
         #image("Treron_vernans_male_-_Kent_Ridge_Park.jpg", width: 40%)
       ]
 
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
-    Here is more text.
+    ]
+
+
+#pop.column-box(heading: "Mamba2 Architecture (Simplified)")[
+    Mamba2 relies on two central mechanisms for propagating information:
+    +  Short 1D causal convolutions #GG[github link]
+    +  A gated recursion relation
+ Letting $x_( s d ) in bb(R)^( mono("seqlen") times mono("d_model") ) $ be an input tensor, the Mamba2 outputs are of the schematic form
+    $
+    z_( s d ) ~ mono("gated_recursion")(mono("causal_conv1d")(x_( s d )))
+    $
+   Both components, described in some more detail below, require adaptation in the context-parallel
+    implementation. For brevity, we suppress batch and head dimensions throughout.
+
+    == Causal Convolutions
+
+    The causal convolution is a depthwise, 1D convolution along the sequence dimension with a short
+    filter, typically of width $K=4$ @causalconv1d:
+    $
+    z_( s d ) = sum_( k= 0 )^( K ) W_( d k ) x_( (s-k) d ) space .
+    $
+
+    == Gated Recursion Relations
+
+    The central elements in the Mamba2 recursion relation are of the form:
+    $
+    z_( s d ) = e^( -A_( s ) ) z_( (s-1)d ) + Delta_( s ) x_( s d )
+    $
+    where the data-dependent $A_( s ), Delta_( s )$ control the deletion and addition of information to the
+    state $z_( s d )$.  While the complete tensor $z_( s d )$ can be constructed in $cal(O)(
+    mono("seqlen") )$ by solving the recursion in the naive manner, such an approach is suboptimal
+    in practice as it cannot leverage GPU tensor cores. For this reason, the recursion is
+    solved using a chunked, matmul-based strategy which has inferior theoretical, big-$cal(O)$ scaling, but
+    superior in-practice wall times @dao2024transformersssmsgeneralizedmodels.
+
     ]
 
     // These properties will be given to the function which is responsible for creating the heading
