@@ -25,21 +25,21 @@
 
     #pop.column-box(heading: "Mamba2: A Linear Attention Layer")[
 
-    The quadratic $cal(O)( mono("seqlen")^( 2 ) )$ scaling of the standard Transformers attention mechanism has
-    increasingly become a bottleneck as context lengths have ballooned with the advent of reasoning
-    models and rising prevalence of modalities such as video and audio.
+      The quadratic $cal(O)( mono("seqlen")^( 2 ) )$ scaling of the standard Transformers attention mechanism has
+      increasingly become a bottleneck as context lengths have ballooned with the advent of reasoning
+      models and rising prevalence of modalities such as video and audio.
 
-    Mamba2 @dao2024transformersssmsgeneralizedmodels is an alternative information propagation
-    algorithm belonging to the steadily growing class of _linear_ $cal(O)( mono("seqlen") )$ attention mechanisms.
-    Its GPU-aware design enables hardware utilization comparable to quadratic attention during
-    training, and reduces the decoding time and cache-space from $cal(O)( mono("seqlen") )$ to $cal(O)( 1 )$. #GG[MODEL REFS!]
- #GG[Arch summary table]
+      Mamba2 @dao2024transformersssmsgeneralizedmodels is an alternative information propagation
+      algorithm belonging to the steadily growing class of _linear_ $cal(O)( mono("seqlen") )$ attention mechanisms.
+      Its GPU-aware design enables hardware utilization comparable to quadratic attention during
+      training, and reduces the decoding time and cache-space from $cal(O)( mono("seqlen") )$ to $cal(O)( 1 )$. #GG[MODEL REFS!]
+      #GG[Arch summary table]
 
-    Fully leveraging this improved scaling requires efficient training of Mamba2-based models on
-    long-sequence documents, which poses engineering challenges due to the linear memory growth with
-    context length. Context-parallelism, in which sequences are sharded along the sequence dimension
-    across GPUs, is a natural and scalable approach to long-sequence training. This poster describes
-    context-parallel implementation for Mamba2. #GG[Should probably mention ring attn somewhere]
+      Fully leveraging this improved scaling requires efficient training of Mamba2-based models on
+      long-sequence documents, which poses engineering challenges due to the linear memory growth with
+      context length. Context-parallelism (CP), in which sequences are sharded along the sequence dimension
+      across GPUs, is a natural and scalable approach to long-sequence training. This poster describes
+      context-parallel implementation for Mamba2. #GG[Should probably mention ring attn somewhere]
 
 
       #figure(
@@ -53,37 +53,100 @@
     ]
 
 
-#pop.column-box(heading: "Mamba2 Architecture (Simplified)")[
-    Mamba2 relies on two central mechanisms for propagating information:
-    +  Short 1D causal convolutions #GG[github link]
-    +  A gated recursion relation
- Letting $x_( s d ) in bb(R)^( mono("seqlen") times mono("d_model") ) $ be an input tensor, the Mamba2 outputs are of the schematic form
-    $
-    z_( s d ) ~ mono("gated_recursion")(mono("causal_conv1d")(x_( s d )))
-    $
-   Both components, described in some more detail below, require adaptation in the context-parallel
-    implementation. For brevity, we suppress batch and head dimensions throughout.
+    #pop.column-box(heading: "Mamba2 Architecture (Simplified)")[
+      Mamba2 relies on two central mechanisms for propagating information:
+      + Short 1D causal convolutions #GG[github link]
+      + A gated recursion relation
+      Letting $x_( s d ) in bb(R)^( mono("seqlen") times mono("d_model") ) $ be an input tensor, the Mamba2 outputs are of the schematic form
+      $
+        z_( s d ) ~ mono("gated_recursion")(mono("causal_conv1d")(x_( s d )))
+      $
+      Both components, described in some more detail below, require adaptation in the context-parallel
+      implementation. For brevity, we suppress batch and head dimensions throughout.
 
-    == Causal Convolutions
+      == Causal Convolutions
 
-    The causal convolution is a depthwise, 1D convolution along the sequence dimension with a short
-    filter, typically of width $K=4$ @causalconv1d:
-    $
-    z_( s d ) = sum_( k= 0 )^( K ) W_( d k ) x_( (s-k) d ) space .
-    $
+      The causal convolution is a depthwise, 1D convolution along the sequence dimension with a short
+      filter, typically of width $K=4$ @causalconv1d:
+      $
+        z_( s d ) = sum_( k= 0 )^( K ) W_( d k ) x_( (s-k) d ) space .
+      $
 
-    == Gated Recursion Relations
+      == Gated Recursion Relations
 
-    The central elements in the Mamba2 recursion relation are of the form:
-    $
-    z_( s d ) = e^( -A_( s ) ) z_( (s-1)d ) + Delta_( s ) x_( s d )
-    $
-    where the data-dependent $A_( s ), Delta_( s )$ control the deletion and addition of information to the
-    state $z_( s d )$.  While the complete tensor $z_( s d )$ can be constructed in $cal(O)(
+      The central elements in the Mamba2 recursion relation are of the form:
+      $
+        z_( s d ) = e^( -A_( s ) ) z_( (s-1)d ) + Delta_( s ) x_( s d )
+      $
+      where the data-dependent $A_( s ) , Delta_( s ) >= 0$ control the deletion and addition of information to the
+      state $z_( s d )$. While the complete tensor $z_( s d )$ can be constructed in $cal(O)(
     mono("seqlen") )$ by solving the recursion in the naive manner, such an approach is suboptimal
-    in practice as it cannot leverage GPU tensor cores. For this reason, the recursion is
-    solved using a chunked, matmul-based strategy which has inferior theoretical, big-$cal(O)$ scaling, but
-    superior in-practice wall times @dao2024transformersssmsgeneralizedmodels.
+      in practice as it cannot leverage GPU tensor cores. For this reason, the recursion is
+      solved using a chunked, matmul-based strategy which has inferior theoretical, big-$cal(O)$ scaling, but
+      superior in-practice wall times @dao2024transformersssmsgeneralizedmodels.
+
+      #GG[figs]
+
+    ]
+
+
+    #pop.column-box(heading: "Context Parallel Convolutions")[
+
+      #GG[fig]
+
+      Context-parallel causal convolutions can be implemented with minimal changes #GG[edit language]. For
+      $mono("seqlen")$ tokens split into chunks of length $C = mono("seqlen") \/ mono("cp_degree")$, a
+      naive intra-chunk convolution whose outputs are nearly all correct: only the first $K - 1 << C$ tokens require fixing.
+
+      An efficient algorithm is a follows:
+      + CP rank $mono("r")$ asynchronously passes its final $K-1$ tokens (`x_send = x[-K+1:]`) to rank $mono("r+1")$
+      + Concurrently, each rank runs the convolution on its locally-available tokens, producing `z = causal_conv1d(x)`
+      + After the $K-1$ passed tokens are received into the buffer `x_recv`, they are concatenated
+        with the first $K-1$ local tokens and the leading $K-1$ tokens of $z$ are overwritten with their
+        their resulting convolution: `z[:K-1] = causal_conv1d(cat(x_recv, x[:K-1]))`.
+
+
+    ]
+
+
+    #pop.column-box(heading: "Context Parallel Gated Recursion")[
+
+      #GG[fig]
+
+      We have implemented several context-parallel version of the Mamba2 gated recursion relation.
+
+      == Simple State Passing
+
+      One implementation leverages the fact that computing the outputs $z_( s d )$ for $s >= s\'$ only requires knowing the inputs $x_( s d )$ at these token positions and the
+      final state at this boundary, i.e. $z_( s d )$ at $s = s\'-1$. The algorithm:
+      + CP rank $r=0$ solves the recursion relation using the locally available inputs and passes its final state `z[-1]` to rank `r = 1`.
+      + CP rank $r=1$ solves its recursion relation with the non-trivial initial state received from rank `r = 0` and passes its final state to `r = 2`
+      + Continue this pattern for all ranks.
+
+      The strict causal dependencies of the Mamba2 algorithm results in idles GPUs in this strategy,
+      with the last CP rank experiencing $cal(O)( mono("seqlen") )$ exposed communication time. If there are no
+      synchronization points (e.g. as induced by tensor-parallelism or FSDP), it is possible to
+      amortize these costs across successive layers via pipelining #GG[fig], but such sync points are
+      common in practice.
+
+
+      == Compute-Then-Correct
+
+      Alternatively, a strategy similar to the CP convolution algorithm is also possible, in which we
+      compute incorrect outputs with locally available tensors, and then correct the results via
+      communication. GPUs never idle with this strategy.
+
+      In order to describe this strategy, we trade the global sequence index $s$ for the pair of indices $r, c$ with $r in {0, ..., mono("cp_degree") - 1}$ indexing
+      the rank and $c in {0, ..., mono("seqlen") \/ mono("cp_degree") - 1 } $ indexing the chunked
+      sequence position. A valid CP implementation is as follows:
+      + Every rank computes $Sigma_( r ) = sum_( c ) A_( r c )$: the sum of local gate values
+      + Rank $r$ asynchronously sends $Sigma_( r )$ to CP ranks $r\' > r$
+      + Every rank solves the recursion relation with its local inputs $x_( r c d )$ and trivial initial state, producing (incorrect) final states $y^( "final" )_(r d )$
+      + Rank $r$ sends $y^( "final" )_( r d )$ to CP ranks $r\' > r$
+      + Rank $r$ computes its corrected initial state via $x_( r d )^( "initial" ) = sum_( r\' < r ) exp(Sigma_( r - 1 ) + ... + Sigma_( r\' + 1 ))y^( "final" )_( r\' d )$
+      + Every rank re-solves the recursion relation with its now-corrected initial states, yielding the correct outputs $z_( r c d )$
+
+      This strategy requires $cal(O)( mono("seqlen") \/ mono("cp_degree") )$ additional compute and has $cal(O)( mono("cp_degree") )$ exposed communication.
 
     ]
 
@@ -180,7 +243,7 @@
     ]
 
     #pop.column-box()[
-      #bibliography("bibliography.bib", title:"References")
+      #bibliography("bibliography.bib", title: "References")
     ]
 
     #pop.column-box(heading: "Fill space with a box", stretch-to-next: true)[
