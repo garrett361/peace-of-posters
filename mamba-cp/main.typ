@@ -1,6 +1,7 @@
 #import "../lib.typ" as pop
 
-#set page("a0", margin: 1cm)
+// #set page("a0", margin: 1cm)
+#set page(width: 121.92cm, height: 91.44cm, margin: 1cm)
 #pop.set-poster-layout(pop.layout-a0)
 #pop.set-theme(pop.ibm)
 #set text(size: pop.layout-a0.at("body-size"))
@@ -17,59 +18,60 @@
   // institutes: "IBM Research",
   // keywords: "Peace, Dove, Poster, Science",
   logo: image("figs/ibm_logo_black_back-cropped.svg", width: 400pt),
+  title-size: 130pt,
+  authors-size: 90pt,
 )
 
 #columns(
-  2,
+  3,
   [
 
     #pop.column-box(heading: "Mamba2: A Linear Attention Layer")[
 
-      The quadratic $cal(O)( mono("seqlen")^( 2 ) )$ scaling of the standard Transformers attention mechanism has
+      The quadratic $cal(O)( mono("seqlen")^( 2 ) )$ scaling of Transformers attention has
       increasingly become a bottleneck as context lengths have ballooned with the advent of reasoning
       models and rising prevalence of modalities such as video and audio.
 
+      #set align(center)
+      #table(
+        columns: 3,
+        inset: (x: 5pt, y: 20pt),
+        [Architecture], [*Prefill/Train*], [*Prefill/Train*],
+        [Attention],
+        [$cal(O)( mono("seqlen")^2 )$],
+        [$cal(O)( mono("seqlen") )$],
+
+        [Mamba2], [$cal(O)( mono("seqlen") )$], [$cal(O)( 1 )$],
+      )
+      #set align(left)
+
       Mamba2 @dao2024transformersssmsgeneralizedmodels is an alternative information propagation
-      algorithm belonging to the steadily growing class of _linear_ $cal(O)( mono("seqlen") )$ attention mechanisms.
-      Its GPU-aware design enables hardware utilization comparable to quadratic attention during
-      training, and reduces the decoding time and cache-space from $cal(O)( mono("seqlen") )$ to $cal(O)( 1 )$. #GG[MODEL REFS!]
-      #GG[Arch summary table]
-
-      Fully leveraging this improved scaling requires efficient training of Mamba2-based models on
-      long-sequence documents, which poses engineering challenges due to the linear memory growth with
-      context length. Context-parallelism (CP), in which sequences are sharded along the sequence dimension
-      across GPUs, is a natural and scalable approach to long-sequence training. This poster describes
-      context-parallel implementation for Mamba2. #GG[Should probably mention ring attn somewhere]
-
-
-      #figure(
-        caption: [
-          Pink-necked green pigeon #cite(<wiki:File:Treron_vernans_male_-_Kent_Ridge_Park.jpg>).
-        ],
-      )[
-        #image("Treron_vernans_male_-_Kent_Ridge_Park.jpg", width: 40%)
-      ]
-
+      algorithm belonging to the steadily growing class of _linear_ $cal(O)( mono("seqlen") )$
+      attention mechanisms @fla. Its GPU-aware design enables hardware utilization comparable to
+      quadratic attention during training, and reduces the decoding time and cache-space from $cal(O)(
+    mono("seqlen") )$ to $cal(O)( 1 )$. See @glorioso2024zambacompact7bssm @bamba
+      @nvidia2025nemotronhfamilyaccurateefficient @granite for a partial list of models which utilize
+      Mamba2
     ]
+
 
 
     #pop.column-box(heading: "Mamba2 Architecture (Simplified)")[
       Mamba2 relies on two central mechanisms for propagating information:
-      + Short 1D causal convolutions #GG[github link]
+      + Short 1D causal convolutions @causalconv1d
       + A gated recursion relation
-      Letting $x_( s d ) in bb(R)^( mono("seqlen") times mono("d_model") ) $ be an input tensor, the Mamba2 outputs are of the schematic form
+      Giving inputs $x_( s d ) in bb(R)^( mono("seqlen") times mono("d_model") ) $, the Mamba2 outputs are schematically
       $
         z_( s d ) ~ mono("gated_recursion")(mono("causal_conv1d")(x_( s d )))
       $
-      Both components, described in some more detail below, require adaptation in the context-parallel
-      implementation. For brevity, we suppress batch and head dimensions throughout.
+      Both components require adaptation in the CP implementation. 
 
       == Causal Convolutions
 
-      The causal convolution is a depthwise, 1D convolution along the sequence dimension with a short
-      filter, typically of width $K=4$ @causalconv1d:
+      The causal convolution @causalconv1d is a depthwise, 1D convolution along the sequence dimension with a short
+      filter, typically of width $K=4$ :
       $
-        z_( s d ) = sum_( k= 0 )^( K ) W_( d k ) x_( (s-k) d ) space .
+        z_( s d ) = sum_( k= 0 )^( K ) W_( k d ) x_( (s-k) d ) space .
       $
 
       == Gated Recursion Relations
@@ -82,62 +84,87 @@
       state $z_( s d )$. While the complete tensor $z_( s d )$ can be constructed in $cal(O)(
     mono("seqlen") )$ by solving the recursion in the naive manner, such an approach is suboptimal
       in practice as it cannot leverage GPU tensor cores. For this reason, the recursion is
-      solved using a chunked, matmul-based strategy which has inferior theoretical, big-$cal(O)$ scaling, but
-      superior in-practice wall times @dao2024transformersssmsgeneralizedmodels.
+      solved using a chunked, matmul-based strategy which has inferior theoretical scaling, but
+      superior in-practice wall time @dao2024transformersssmsgeneralizedmodels.
 
-      #GG[figs]
-
-    ]
-
-
-    #pop.column-box(heading: "Context Parallel Convolutions")[
-
-      #GG[fig]
-
-      Context-parallel causal convolutions can be implemented with minimal changes #GG[edit language]. For
-      $mono("seqlen")$ tokens split into chunks of length $C = mono("seqlen") \/ mono("cp_degree")$, a
-      naive intra-chunk convolution whose outputs are nearly all correct: only the first $K - 1 << C$ tokens require fixing.
-
-      An efficient algorithm is a follows:
-      + CP rank $mono("r")$ asynchronously passes its final $K-1$ tokens (`x_send = x[-K+1:]`) to rank $mono("r+1")$
-      + Concurrently, each rank runs the convolution on its locally-available tokens, producing `z = causal_conv1d(x)`
-      + After the $K-1$ passed tokens are received into the buffer `x_recv`, they are concatenated
-        with the first $K-1$ local tokens and the leading $K-1$ tokens of $z$ are overwritten with their
-        their resulting convolution: `z[:K-1] = causal_conv1d(cat(x_recv, x[:K-1]))`.
-
+      #figure(
+      )[
+        #image("figs/mamba_scan_and_conv.png", width: 60%)
+      ]
 
     ]
 
+    #pop.column-box(heading: "Context Parallelism")[
 
-    #pop.column-box(heading: "Context Parallel Gated Recursion")[
+      Leveraging Mamba2's long-context scaling advantages requires long-context training which
+poses engineering challenges as $mono("activation_mem") prop mono("seqlen") $ .
 
-      #GG[fig]
+      Context-parallelism (CP), in which sequences are sharded along the sequence
+      dimension, is a natural and scalable approach to long-sequence training.  
 
-      We have implemented several context-parallel version of the Mamba2 gated recursion relation.
-
-      == Simple State Passing
-
-      One implementation leverages the fact that computing the outputs $z_( s d )$ for $s >= s\'$ only requires knowing the inputs $x_( s d )$ at these token positions and the
-      final state at this boundary, i.e. $z_( s d )$ at $s = s\'-1$. The algorithm:
-      + CP rank $r=0$ solves the recursion relation using the locally available inputs and passes its final state `z[-1]` to rank `r = 1`.
-      + CP rank $r=1$ solves its recursion relation with the non-trivial initial state received from rank `r = 0` and passes its final state to `r = 2`
-      + Continue this pattern for all ranks.
-
-      The strict causal dependencies of the Mamba2 algorithm results in idles GPUs in this strategy,
-      with the last CP rank experiencing $cal(O)( mono("seqlen") )$ exposed communication time. If there are no
-      synchronization points (e.g. as induced by tensor-parallelism or FSDP), it is possible to
-      amortize these costs across successive layers via pipelining #GG[fig], but such sync points are
-      common in practice.
+    // #GG[Should probably mention ring attn somewhere]
 
 
-      == Compute-Then-Correct
+      #figure(
+        caption: [
+          Context Parallel Sharding
+        ],
+      )[
+        #image("figs/simple_cp_chunking.png", width: 100%)
+      ]
+
+    ]
+
+    #pop.column-box(heading: "CP Convolutions")[
+
+      #figure(
+        caption: [
+          Context Parallel Causal Convolution
+        ],
+      )[
+        #image("figs/cp_causal_conv.png", width: 90%)
+      ]
+
+      Only minimal modifications required for CP causal convolutions. Each GPU handles $C =
+    mono("seqlen") \/ mono("cp_degree")$ tokens, and only the outputs for the first $K-1 << C$
+      tokens require communication for computational correctness.
+
+      An efficient algorithm is as follows:
+      + CP rank $mono("r")$ asynchronously passes its final $K-1$ tokens to rank $mono("r+1")$
+      + Concurrently, ranks convolve their local tokens: `z = causal_conv1d(x)`
+      + The leading outputs are corrected via the received tokens: \ `z[:K-1] = causal_conv1d(cat(x_recv, x[:K-1]))`
+
+
+    ]
+
+    #pop.column-box(heading: "CP Rescursion: State Passing")[
+      A straightforward CP implementation of Mamba2's recursion step comes from passing state across
+CP boundaries. This proceeds as follows:
+
+      + Rank $r$ solves the recursion locally and passes `z[-1]` to rank `r + 1`.
+      + Rank $r+1$ waits on the passed state, then solves recursion locally. 
+
+      The causal Mamba2 dependencies result in $cal(O)( mono("seqlen") )$ exposed communication. However,
+pipelining can be use to amortize this cost.
+
+
+      #figure(
+      )[
+        #image("figs/serial_cp_pipelining.png", width: 50%)
+      ]
+
+    ]
+
+    #pop.column-box(heading: "CP Recursion: Compute-Then-Correct")[
+
+      An alternative implementation which can have better strong-scaling properties is as follows:
 
       Alternatively, a strategy similar to the CP convolution algorithm is also possible, in which we
       compute incorrect outputs with locally available tensors, and then correct the results via
       communication. GPUs never idle with this strategy.
 
       In order to describe this strategy, we trade the global sequence index $s$ for the pair of indices $r, c$ with $r in {0, ..., mono("cp_degree") - 1}$ indexing
-      the rank and $c in {0, ..., mono("seqlen") \/ mono("cp_degree") - 1 } $ indexing the chunked
+      the CP rank and $c in {0, ..., mono("seqlen") \/ mono("cp_degree") - 1 } $ indexing the chunked
       sequence position. A valid CP implementation is as follows:
       + Every rank computes $Sigma_( r ) = sum_( c ) A_( r c )$: the sum of local gate values
       + Rank $r$ asynchronously sends $Sigma_( r )$ to CP ranks $r\' > r$
@@ -165,97 +192,10 @@
       (paint: gradient.linear(green, red, blue), thickness: 10pt),
     )
 
-    #pop.column-box(
-      heading: "Biological Information",
-      heading-box-args: hba,
-      body-box-args: bba,
-    )[
-      #table(
-        columns: (auto, 1fr),
-        inset: 0.5cm,
-        stroke: (x, y) => if y >= 0 { (bottom: 0.2pt + black) },
-        [Domain], [Eukaryota],
-        [Kingdom], [Animalia],
-        [Phylum], [Chordata],
-        [Class], [Aves],
-        [Clade], [Columbimorphae],
-        [Order], [Columbiformes],
-        [Family], [Columbidae],
-        [Type genus], [Columba],
-      )
-
-      This box is styled differently compared to the others.
-      To make such changes persistent across the whole poster, we can use these functions:
-      ```typst
-      #pop.update-poster-layout(...)
-      #pop.update-theme()
-      ```
-    ]
-
-    #pop.column-box(heading: "Peace of Posters Documentation")[
-      You can find more information on the documentation site under
-      #text(fill: red)[
-      #link("https://jonaspleyer.github.io/peace-of-posters/")[
-        jonaspleyer.github.io/peace-of-posters/
-      ]
-    ].
-
-      #figure(
-        caption: [
-          The poster from the thumbnail can be viewed at the documentation website as well.
-        ],
-      )[
-        #link("https://jonaspleyer.github.io/peace-of-posters/")[
-          #image("thumbnail.png", width: 50%)
-        ]
-      ]
-    ]
-
-    #colbreak()
-
-    #pop.column-box(heading: "General Relativity")[
-      Einstein's brilliant theory of general relativity
-      starts with the field equations #cite(<Einstein1916>).
-      $ G_(mu nu) + Lambda g_(mu nu) = kappa T_(mu nu) $
-      However, they have nothing to do with doves.
-    ]
-
-    #pop.column-box(heading: "Peace be with you")[
-      #figure(
-        caption: [
-          'Doves [...] are used in many settings as symbols of peace, freedom or love.
-          Doves appear in the symbolism of Judaism, Christianity, Islam and paganism, and of both
-          military and pacifist groups.'
-          #cite(<wiki:Doves_as_symbols>).
-        ],
-      )[
-        #image("peace-dove.png")
-      ]
-    ]
-
-    #pop.column-box(heading: "Etymology")[
-      Pigeon is a French word that derives from the Latin pīpiō, for a 'peeping' chick,
-      while dove is an ultimately Germanic word, possibly referring to the bird's diving flight.
-      The English dialectal word culver appears to derive from Latin columba
-      #cite(<wiki:Online_Etymology_Dictionary>).
-      A group of doves is called a "dule", taken from the French word deuil ('mourning')
-      @Lipton1991-qa.
-    ]
 
     #pop.column-box()[
       #bibliography("bibliography.bib", title: "References")
-    ]
+    ],
 
-    #pop.column-box(heading: "Fill space with a box", stretch-to-next: true)[
-      Notice that this box would not fill the entire space up to the bottom of the page but we
-      can stretch it such that it does so anyway.
-    ]
   ],
 )
-
-#pop.bottom-box()[
-  Bottom Boxes are displayed at the bottom of a page.
-  #linebreak()
-  Download more RAM: #link("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
-]
-
