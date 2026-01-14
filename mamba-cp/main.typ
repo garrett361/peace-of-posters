@@ -35,8 +35,8 @@
       #set align(center)
       #table(
         columns: 3,
-        inset: (x: 5pt, y: 20pt),
-        [Architecture], [*Prefill/Train*], [*Prefill/Train*],
+        inset: (x: 15pt, y: 20pt),
+        [Architecture], [*Prefill/Train*], [*Decode*],
         [Attention],
         [$cal(O)( mono("seqlen")^2 )$],
         [$cal(O)( mono("seqlen") )$],
@@ -48,10 +48,9 @@
       Mamba2 @dao2024transformersssmsgeneralizedmodels is an alternative information propagation
       algorithm belonging to the steadily growing class of _linear_ $cal(O)( mono("seqlen") )$
       attention mechanisms @fla. Its GPU-aware design enables hardware utilization comparable to
-      quadratic attention during training, and reduces the decoding time and cache-space from $cal(O)(
-    mono("seqlen") )$ to $cal(O)( 1 )$. See @glorioso2024zambacompact7bssm @bamba
-      @nvidia2025nemotronhfamilyaccurateefficient @granite for a partial list of models which utilize
-      Mamba2
+      attention during training, and reduces the decoding time and cache-space from $cal(O)(
+    mono("seqlen") )$ to $cal(O)( 1 )$. Models utilizing Mamba2 layers include @glorioso2024zambacompact7bssm @bamba
+      @nvidia2025nemotronhfamilyaccurateefficient @granite.
     ]
 
 
@@ -137,7 +136,7 @@ poses engineering challenges as $mono("activation_mem") prop mono("seqlen") $ .
 
     ]
 
-    #pop.column-box(heading: "CP Rescursion: State Passing")[
+    #pop.column-box(heading: "CP Recursion: State Passing")[
       A straightforward CP implementation of Mamba2's recursion step comes from passing state across
 CP boundaries. This proceeds as follows:
 
@@ -145,7 +144,7 @@ CP boundaries. This proceeds as follows:
       + Rank $r+1$ waits on the passed state, then solves recursion locally. 
 
       The causal Mamba2 dependencies result in $cal(O)( mono("seqlen") )$ exposed communication. However,
-pipelining can be use to amortize this cost.
+pipelining can be use to amortize this cost @dao2024transformersssmsgeneralizedmodels.
 
 
       #figure(
@@ -159,21 +158,35 @@ pipelining can be use to amortize this cost.
 
       An alternative implementation which can have better strong-scaling properties is as follows:
 
-      Alternatively, a strategy similar to the CP convolution algorithm is also possible, in which we
-      compute incorrect outputs with locally available tensors, and then correct the results via
-      communication. GPUs never idle with this strategy.
-
-      In order to describe this strategy, we trade the global sequence index $s$ for the pair of indices $r, c$ with $r in {0, ..., mono("cp_degree") - 1}$ indexing
-      the CP rank and $c in {0, ..., mono("seqlen") \/ mono("cp_degree") - 1 } $ indexing the chunked
-      sequence position. A valid CP implementation is as follows:
-      + Every rank computes $Sigma_( r ) = sum_( c ) A_( r c )$: the sum of local gate values
-      + Rank $r$ asynchronously sends $Sigma_( r )$ to CP ranks $r\' > r$
-      + Every rank solves the recursion relation with its local inputs $x_( r c d )$ and trivial initial state, producing (incorrect) final states $y^( "final" )_(r d )$
+      + Every rank computes $Sigma_( r ) = sum_( c ) A_( r c )$ and async sends to ranks $r\' > r$
+      + Every rank solves their local recursion,  producing (incorrect) states $y^( "final" )_(r d )$
       + Rank $r$ sends $y^( "final" )_( r d )$ to CP ranks $r\' > r$
-      + Rank $r$ computes its corrected initial state via $x_( r d )^( "initial" ) = sum_( r\' < r ) exp(Sigma_( r - 1 ) + ... + Sigma_( r\' + 1 ))y^( "final" )_( r\' d )$
-      + Every rank re-solves the recursion relation with its now-corrected initial states, yielding the correct outputs $z_( r c d )$
+      + Rank $r$ corrects its initial state: $x_( r d )^( "initial" ) = sum_( r\' < r ) exp(sum_( r\'\'=r+1 )^( r-1 )Sigma_( r\'\' ))y^( "final" )_( r\' d )$
+      + Every rank re-solves the recursion relation with its corrected initial states
 
       This strategy requires $cal(O)( mono("seqlen") \/ mono("cp_degree") )$ additional compute and has $cal(O)( mono("cp_degree") )$ exposed communication.
+
+    ]
+
+    #pop.column-box(heading: "Scaling")[
+
+#figure(
+  grid(
+    columns: 2,
+    gutter: 1em,
+        image("figs/throughput_vs_seqlen.png", width: 105%),
+        image("figs/throughput_vs_cp_degree.png", width: 105%)
+  ),
+  caption: [
+
+      #set align(left)
+      Scaling performance for a stack of eight `d_model=4906` Mamba2 layers on H100 GPUs.  Left:
+      throughput vs `seqlen` at `cp_degree=8`. Per-GPU performance increases with `seqlen` since compute
+      $~cal(O)( mono("seqlen") )$ while comms $ ~cal(O)( 1 )$ at fixed `cp_degree`. Right: strong
+      scaling at fixed `seqlen` and varying `cp_degree` for the compute-then-correct strategy.
+      Per-GPU performance is relatively stable across GPU-count and `seqlen`.
+
+    ]) 
 
     ]
 
@@ -194,6 +207,7 @@ pipelining can be use to amortize this cost.
 
 
     #pop.column-box()[
+    #set text(size: 24pt)
       #bibliography("bibliography.bib", title: "References")
     ],
 
