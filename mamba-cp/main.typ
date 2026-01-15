@@ -59,18 +59,22 @@
       Mamba2 relies on two central mechanisms for propagating information:
       + Short 1D causal convolutions @causalconv1d
       + A gated recursion relation
-      Giving inputs $x_( s d ) in bb(R)^( mono("seqlen") times mono("d_model") ) $, the Mamba2 outputs are schematically
+      Given inputs $x_( s d ) in bb(R)^( mono("seqlen") times mono("d_model") ) $, the Mamba2 outputs are schematically
       $
         z_( s d ) ~ mono("gated_recursion")(mono("causal_conv1d")(x_( s d )))
       $
-      Both components require adaptation in the CP implementation. 
+      Both components require adaptation in the CP implementation.
+
+      #figure()[
+        #image("figs/mamba_scan_and_conv.png", width: 60%)
+      ]
 
       == Causal Convolutions
 
       The causal convolution @causalconv1d is a depthwise, 1D convolution along the sequence dimension with a short
       filter, typically of width $K=4$ :
       $
-        z_( s d ) = sum_( k= 0 )^( K ) W_( k d ) x_( (s-k) d ) space .
+        z_( s d ) = sum_( k= 0 )^( K-1 ) W_( k d ) x_( (s-k) d ) space .
       $
 
       == Gated Recursion Relations
@@ -79,29 +83,24 @@
       $
         z_( s d ) = e^( -A_( s ) ) z_( (s-1)d ) + Delta_( s ) x_( s d )
       $
-      where the data-dependent $A_( s ) , Delta_( s ) >= 0$ control the deletion and addition of information to the
+      where the data-dependent $A_( s ), Delta_( s ) >= 0$ control the deletion and addition of information to the
       state $z_( s d )$. While the complete tensor $z_( s d )$ can be constructed in $cal(O)(
     mono("seqlen") )$ by solving the recursion in the naive manner, such an approach is suboptimal
       in practice as it cannot leverage GPU tensor cores. For this reason, the recursion is
       solved using a chunked, matmul-based strategy which has inferior theoretical scaling, but
       superior in-practice wall time @dao2024transformersssmsgeneralizedmodels.
 
-      #figure(
-      )[
-        #image("figs/mamba_scan_and_conv.png", width: 60%)
-      ]
-
     ]
 
     #pop.column-box(heading: "Context Parallelism")[
 
       Leveraging Mamba2's long-context scaling advantages requires long-context training which
-poses engineering challenges as $mono("activation_mem") prop mono("seqlen") $ .
+      poses engineering challenges as $mono("activation_mem") prop mono("seqlen") $ .
 
       Context-parallelism (CP), in which sequences are sharded along the sequence
-      dimension, is a natural and scalable approach to long-sequence training.  
+      dimension, is a natural and scalable approach to long-sequence training.
 
-    // #GG[Should probably mention ring attn somewhere]
+      // #GG[Should probably mention ring attn somewhere]
 
 
       #figure(
@@ -138,17 +137,16 @@ poses engineering challenges as $mono("activation_mem") prop mono("seqlen") $ .
 
     #pop.column-box(heading: "CP Recursion: State Passing")[
       A straightforward CP implementation of Mamba2's recursion step comes from passing state across
-CP boundaries. This proceeds as follows:
+      CP boundaries. This proceeds as follows:
 
       + Rank $r$ solves the recursion locally and passes `z[-1]` to rank `r + 1`.
-      + Rank $r+1$ waits on the passed state, then solves recursion locally. 
+      + Rank $r+1$ waits on the passed state, then solves recursion locally.
 
       The causal Mamba2 dependencies result in $cal(O)( mono("seqlen") )$ exposed communication. However,
-pipelining can be use to amortize this cost @dao2024transformersssmsgeneralizedmodels.
+      pipelining can be use to amortize this cost @dao2024transformersssmsgeneralizedmodels.
 
 
-      #figure(
-      )[
+      #figure()[
         #image("figs/serial_cp_pipelining.png", width: 50%)
       ]
 
@@ -156,37 +154,37 @@ pipelining can be use to amortize this cost @dao2024transformersssmsgeneralizedm
 
     #pop.column-box(heading: "CP Recursion: Compute-Then-Correct")[
 
-      An alternative implementation which can have better strong-scaling properties is as follows:
+      An alternative implementation which tends to have better scaling at large `cp_degree`, relative to the non-pipelined `serial` version, is as
+      follows.
 
       + Every rank computes $Sigma_( r ) = sum_( c ) A_( r c )$ and async sends to ranks $r\' > r$
-      + Every rank solves their local recursion,  producing (incorrect) states $y^( "final" )_(r d )$
+      + Every rank solves their local recursion, producing (incorrect) states $y^( "final" )_(r d )$
       + Rank $r$ sends $y^( "final" )_( r d )$ to CP ranks $r\' > r$
       + Rank $r$ corrects its initial state: $x_( r d )^( "initial" ) = sum_( r\' < r ) exp(sum_( r\'\'=r+1 )^( r-1 )Sigma_( r\'\' ))y^( "final" )_( r\' d )$
       + Every rank re-solves the recursion relation with its corrected initial states
-
-      This strategy requires $cal(O)( mono("seqlen") \/ mono("cp_degree") )$ additional compute and has $cal(O)( mono("cp_degree") )$ exposed communication.
-
     ]
 
     #pop.column-box(heading: "Scaling")[
 
-#figure(
-  grid(
-    columns: 2,
-    gutter: 1em,
-        image("figs/throughput_vs_seqlen.png", width: 105%),
-        image("figs/throughput_vs_cp_degree.png", width: 105%)
-  ),
-  caption: [
+      #figure(
+        grid(
+          columns: 2,
+          gutter: 1em,
+          image("figs/throughput_vs_seqlen.png", width: 105%),
+          image("figs/throughput_vs_cp_degree.png", width: 105%),
+        ),
+        caption: [
+          Scaling perf for a stack of eight `d_model=4906` Mamba2 layers on H100 GPUs. Left:
+      throughput vs `seqlen` (32k to 4M) at `cp_degree=8`. Compute scales as $~cal(O)( mono("seqlen") )$ while comms $ ~cal(O)( 1 )$ at fixed
+      `cp_degree`. Right: strong scaling. Fixed `seqlen` and varying `cp_degree` for 
+      compute-then-correct. 
+        ],
+      )
 
-      #set align(left)
-      Scaling performance for a stack of eight `d_model=4906` Mamba2 layers on H100 GPUs.  Left:
-      throughput vs `seqlen` at `cp_degree=8`. Per-GPU performance increases with `seqlen` since compute
-      $~cal(O)( mono("seqlen") )$ while comms $ ~cal(O)( 1 )$ at fixed `cp_degree`. Right: strong
-      scaling at fixed `seqlen` and varying `cp_degree` for the compute-then-correct strategy.
-      Per-GPU performance is relatively stable across GPU-count and `seqlen`.
-
-    ]) 
+      #figure(caption: [The benefits of `serial` pipelining increase with `cp_degree`.],)[
+        #image("figs/serial_pipeline_ablation_strong_scaling.png", width: 100%,
+      )
+      ]
 
     ]
 
